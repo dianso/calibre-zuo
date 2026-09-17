@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build plugin
+        run: python build.py
+
+      - name: Rename asset
+        run: cp out/Calibre-ZUO.zip calibre-zuo.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: calibre-zuo.zip
+          name: Calibre-ZUO ${{ github.ref_name }}
+          body: |
+            一个使用 zuo.cc API 作为数据源的 Calibre 网文刮削工具。
+
+            ## 安装
+            在 Calibre 中：首选项 → 插件 → 从文件加载插件 → 选择 calibre-zuo.zip。
+            然后在「获取元数据 / 下载封面」插件列表里勾选 Calibre-ZUO 即可。
+          draft: false
+          prerelease: false
