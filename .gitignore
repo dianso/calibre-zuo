@@ -1,0 +1,13 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+
+# 打包输出
+out/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+# 发布用压缩包（由 release 承载，不入库）
+calibre-zuo.zip
