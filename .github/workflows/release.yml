@@ -23,9 +23,6 @@ jobs:
       - name: Build plugin
         run: python build.py
 
-      - name: Rename asset
-        run: cp out/Calibre-ZUO.zip calibre-zuo.zip
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

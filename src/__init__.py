@@ -4,148 +4,218 @@ Calibre-ZUO 数据源客户端 + 请求签名复刻。
 
 背景
 ----
-目标站点（zuo.cc）的公开只读接口（/api/novel/search、/api/novel 等）虽然登录层面允许
-匿名访问，但被列在其「API 签名白名单」内：任何请求缺 zuo-cc-ts / zuo-cc-nonce /
-zuo-cc-sign 三个头都会返回 401 SIGN_MISSING。
+目标站点（zuo.cc）的公开只读接口（/api/novel/search、/api/novel 等）虽允许匿名访问，
+但会被动态签名校验拦截。zuo 后端已切换为「动态签名方案」（shared/src/utils/api-sign.ts）：
+    - 先经免签端点 GET /api/security/seed 握得三段式 seed（base64url(safeIp|ts|ver).mac）
+    - 由 seed 无状态解包绑定的算法版本 v0~v3（30 分钟棘轮轮换）
+    - 单请求头 zuo-cc-auth: {seed}:{ts}:{nonce}:{sign}
+    - sign = hex(HMAC-SHA256(key=seed, canonical))，canonical 由六段按版本拼装
+    - 服务端经 zuo-cc-seed / zuo-cc-time 响应头顺风车下发新种子与高精度时间戳
+    - 401 且 detail 为 SIGN_EXPIRED / SIGN_IP_MISMATCH 时重新握手 seed 静默重试一次
 
-签名算法来自后端 shared 源码（shared/src/utils/api-sign.ts）：
-    canonical = METHOD\nPATH\n排序后 query\n空 body 哈希\nts\nonce
-    密钥 key  = hex(SHA-256(素材以 "|" 拼接))
-    签名      = hex(HMAC-SHA256(key, canonical))
-其中密钥素材由公开字面量常量派生（并非真正机密，定位仅是抬高简单脚本抓取门槛）。
-
-!!! 耦合警告 !!!
-本文件中的 SIGNED_API_PATHS 必须与后端 shared/src/utils/api-sign.ts 保持完全一致
-（顺序、内容都不能变，因为密钥由它派生）。后端每改动一次白名单，本插件都必须
-同步更新并重新打包，否则签名失配。
-
-小写十六进制常量均直接取自后端源码，禁止「随手改动」。
+实现逐字符照抄 shared/src/utils/api-sign.ts，禁止「随手改动」小写十六进制等常量。
 """
+import base64
 import gzip
 import hashlib
 import hmac
 import json
 import os
 import time
+from functools import cmp_to_key
+from threading import Lock
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
-# 请求头常量（与 shared/src/utils/api-sign.ts 对齐）
+# 请求头/协议常量（与 shared/src/utils/api-sign.ts 对齐）
 # ---------------------------------------------------------------------------
-API_SIGN_TS_HEADER = "zuo-cc-ts"
-API_SIGN_NONCE_HEADER = "zuo-cc-nonce"
-API_SIGN_HEADER = "zuo-cc-sign"
+API_AUTH_HEADER = "zuo-cc-auth"                 # 单请求头，紧凑四要素 seed:ts:nonce:sign
+API_SEED_HEADER = "zuo-cc-seed"                 # 服务端顺风车下发的下一次新种子响应头
+API_SERVER_TIME_HEADER = "zuo-cc-time"          # 服务端高精度时间戳响应头（毫秒）
 
-# 时间戳窗口：±5 分钟（毫秒）
-API_SIGN_WINDOW_MS = 300000
+API_SEED_TTL_MS = 15 * 60 * 1000                # 种子默认存活有效期：15 分钟（毫秒）
+API_SIGN_WINDOW_MS = 5 * 60 * 1000              # 时间戳允许窗口：±5 分钟（毫秒）
+API_ALGO_ROTATION_INTERVAL_MS = 30 * 60 * 1000  # 算法轮换时间槽：30 分钟（毫秒）
+API_ALGO_VERSIONS_COUNT = 4                     # 动态算法变体数量：v0 ~ v3
 
-# ---------------------------------------------------------------------------
-# 密钥派生素材（三段独立随机 hex，取自 shared 源码；命名与后端对齐，无 secret 字样）
-# ---------------------------------------------------------------------------
-_API_SIGN_MATERIAL_SEGMENT_A = "277381cbe01c08f85a2dd8eca1ffbb62"
-_API_SIGN_MATERIAL_SEGMENT_B = "67e7903c3da43115b688155a8b05998c"
-_API_SIGN_MATERIAL_SEGMENT_C = "5fe1e16a010dbf2b64032dcfcc710678"
+SEED_ENDPOINT = "/api/security/seed"            # 免签的种子交换端点
 
-# 空串的 SHA-256 hex：白名单接口全部为 GET 无请求体
+# 空串的 SHA-256 hex：公开接口无请求体，body 哈希双端固定为此常量
 API_SIGN_EMPTY_BODY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-# ---------------------------------------------------------------------------
-# 签名白名单（!! 必须与后端 shared/src/utils/api-sign.ts 的 SIGNED_API_PATHS 完全一致 !!）
-# ---------------------------------------------------------------------------
-SIGNED_API_PATHS = [
-    "/api/novel",
-    "/api/novel/massive",
-    "/api/novel/badge",
-    "/api/novel/tag/:slug",
-    "/api/novel/achievements",
-    "/api/novel/fans-count",
-    "/api/novel/rating",
-    "/api/novel/read-count",
-    "/api/novel/word-count",
-    "/api/novel/first-order",
-    "/api/novel/recommended-count",
-    "/api/novel/favorited-count",
-    "/api/novel/average-sub",
-    "/api/novel/max-sub",
-    "/api/novel/fanqie-read-count",
-    "/api/system-booklist/novels",
-    "/api/author",
-    "/api/novel/wanding-authors",
-    "/api/novel/origin",
-    "/api/novel/date",
-    "/api/novel/date/years",
-    "/api/author/:penName/novels",
-    "/api/novel/search",
-    "/api/novel/advanced-search",
-    "/api/author/search",
-    "/api/wiki/search",
-    "/api/author/vintage",
-    "/api/author/tomato",
-    "/api/author/yuewen",
-    "/api/author/multi-open",
-    "/api/author/most-words",
-    "/api/author/eunuch",
-    "/api/author/deceased",
-    "/api/author/alias",
-    "/api/plagiarism",
-    "/api/timeline",
-    "/api/timeline/stats",
-    "/api/activities",
-    "/api/wiki/entities",
-    "/api/wiki/entity-names",
-]
+# 401 details 前缀与可自愈白名单
+_SIGN_DETAIL_PREFIX = "SIGN_"
+_SIGN_SELF_HEAL_DETAILS = ("SIGN_EXPIRED", "SIGN_IP_MISMATCH")
 
 
 class ZuoApiError(Exception):
     """封装站点 API 的稳定可读错误。"""
 
+    def __init__(self, message, sign_detail=None):
+        super().__init__(message)
+        self.sign_detail = sign_detail
+
 
 # ---------------------------------------------------------------------------
-# 签名算法实现（与前端 computed 结果逐字节一致）
+# 动态签名算法实现（与 shared/src/utils/api-sign.ts 逐字节一致）
 # ---------------------------------------------------------------------------
 
-def derive_sign_key() -> str:
-    """按后端算法派生签名密钥：返回 SHA-256(素材以"|"拼接) 的 hex 小写串。"""
-    material = "|".join(
-        [
-            _API_SIGN_MATERIAL_SEGMENT_A,
-            "\n".join(SIGNED_API_PATHS),
-            _API_SIGN_MATERIAL_SEGMENT_B,
-            API_SIGN_EMPTY_BODY_HASH,
-            str(API_SIGN_WINDOW_MS),
-            _API_SIGN_MATERIAL_SEGMENT_C,
-        ]
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+def get_current_algo_version(now_ms):
+    """按毫秒时间戳计算 30 分钟时间槽对应的算法版本号（0~3），兼容负值槽位。"""
+    slot = now_ms // API_ALGO_ROTATION_INTERVAL_MS
+    return ((slot % API_ALGO_VERSIONS_COUNT) + API_ALGO_VERSIONS_COUNT) % API_ALGO_VERSIONS_COUNT
 
 
-def build_canonical_query(pairs):
-    """规范化 query：剥掉 key 尾部 []、按 key 排序、以原始值拼 k=v&k=v。"""
+def _b64url_decode_bytes(base64_payload):
+    """base64url 解码为字节串（- -> +、_ -> /，补齐填充）。"""
+    s = base64_payload.replace("-", "+").replace("_", "/")
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+    return base64.b64decode(s, validate=True)
+
+
+def extract_algo_version_from_seed(seed):
+    """从三段式 seed（base64url(safeIp|ts|ver).mac）无状态解包算法版本号（0~3）。
+
+    格式不符/非法/越界时安全回退至 0（与 TS extractAlgoVersionFromSeed 一致）。
+    """
+    if not seed or not isinstance(seed, str):
+        return 0
+    dot = seed.find(".")
+    if dot <= 0:
+        return 0
+    base64_payload = seed[:dot]
+    try:
+        raw = _b64url_decode_bytes(base64_payload)
+    except Exception:
+        return 0
+    parts = raw.split(b"|")
+    if len(parts) != 3:
+        return 0
+    ver_part = parts[2]
+    if ver_part is not None:
+        try:
+            ver = int(ver_part)
+        except (TypeError, ValueError):
+            ver = None
+        if ver is not None and 0 <= ver < API_ALGO_VERSIONS_COUNT:
+            return ver
+    return 0
+
+
+def generate_api_sign_nonce():
+    """生成 16 字节随机数的 hex 字符串（32 字符）。"""
+    return os.urandom(16).hex()
+
+
+def fnv1a32(s):
+    """32 位 FNV-1a 纯同步哈希，用于 v3 键名确定性加权排序。"""
+    h = 0x811C9DC5
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def normalize_query_pairs(pairs):
+    """规范化 query 键名：剥掉 key 尾部 []（axios 数组序列化产物，如 tags[]=a）。"""
     normalized = []
     for raw_key, value in pairs:
         key = raw_key[:-2] if raw_key.endswith("[]") else raw_key
         normalized.append((key, value))
-    # sorted 默认按第一个元素（key）按 Unicode 码点排序，与 JS toSorted 对齐
-    normalized.sort(key=lambda item: item[0])
-    return "&".join(f"{k}={v}" for k, v in normalized)
+    return normalized
 
 
-def sign_request(method, path, query_params):
-    """为指定 path 与 query 计算三芝麻认证头部（ts/nonce/sign）。"""
-    canonical_query = build_canonical_query(query_params)
-    ts = str(int(time.time() * 1000))
-    nonce = os.urandom(16).hex()
-    canonical = "\n".join([method, path, canonical_query, API_SIGN_EMPTY_BODY_HASH, ts, nonce])
-    key = derive_sign_key().encode("utf-8")
-    signature = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-    return {
-        API_SIGN_TS_HEADER: ts,
-        API_SIGN_NONCE_HEADER: nonce,
-        API_SIGN_HEADER: signature,
-    }
+def _cmp_v0(a, b):
+    """v0: key code-unit 升序；同 key 按 value 升序。"""
+    if a[0] != b[0]:
+        return -1 if a[0] < b[0] else 1
+    if a[1] < b[1]:
+        return -1
+    if a[1] > b[1]:
+        return 1
+    return 0
+
+
+def _cmp_v1(a, b):
+    """v1: key 长度降序；同长按 key 倒序；同 key 按 value 升序。"""
+    len_diff = len(b[0]) - len(a[0])
+    if len_diff != 0:
+        return len_diff
+    if a[0] != b[0]:
+        return 1 if a[0] < b[0] else -1
+    if a[1] < b[1]:
+        return -1
+    if a[1] > b[1]:
+        return 1
+    return 0
+
+
+def _cmp_v2(a, b):
+    """v2: key code-unit 降序；同 key 按 value 降序。"""
+    if a[0] != b[0]:
+        return 1 if a[0] < b[0] else -1
+    if a[1] < b[1]:
+        return 1
+    if a[1] > b[1]:
+        return -1
+    return 0
+
+
+def _cmp_v3(a, b):
+    """v3: key 按 FNV-1a 哈希数值升序；同哈希按 key 升序；同 key 按 value 升序。"""
+    hash_diff = fnv1a32(a[0]) - fnv1a32(b[0])
+    if hash_diff != 0:
+        return hash_diff
+    if a[0] != b[0]:
+        return -1 if a[0] < b[0] else 1
+    if a[1] < b[1]:
+        return -1
+    if a[1] > b[1]:
+        return 1
+    return 0
+
+
+_CMP_BY_VERSION = {0: _cmp_v0, 1: _cmp_v1, 2: _cmp_v2, 3: _cmp_v3}
+
+
+def build_canonical_query_by_version(version, pairs):
+    """按算法版本拼装规范化 query 字符串（逐字符对齐 TS buildCanonicalQueryByVersion）。"""
+    lst = normalize_query_pairs(pairs)
+    if not lst:
+        return ""
+    cmp_fn = _CMP_BY_VERSION.get(version, _cmp_v0)
+    lst = sorted(lst, key=cmp_to_key(cmp_fn))
+    if version == 1:
+        return "#".join(f"{k}:{v}" for k, v in lst)
+    if version == 2:
+        return "$".join(f"{v}@{k}" for k, v in lst)
+    if version == 3:
+        return "--".join(f"[{k}][{v}]" for k, v in lst)
+    return "&".join(f"{k}={v}" for k, v in lst)
+
+
+def build_canonical_query(pairs):
+    """v0 规范的向后兼容包装。"""
+    return build_canonical_query_by_version(0, pairs)
+
+
+def build_api_sign_canonical_string(method, path, query_pairs, body_hash, ts, nonce,
+                                    seed=None, version=None):
+    """多版本 canonical 六段组装（逐字符对齐 TS buildApiSignCanonicalString）。"""
+    ver = version if version is not None else (extract_algo_version_from_seed(seed) if seed else 0)
+    query_str = build_canonical_query_by_version(ver, query_pairs)
+    if ver == 1:
+        return "|".join([ts, method, path, query_str, nonce, body_hash])
+    if ver == 2:
+        return "~".join([path, nonce, method, ts, query_str, body_hash])
+    if ver == 3:
+        return ";;".join(["V3", nonce, ts, body_hash, path, method, query_str])
+    return "\n".join([method, path, query_str, body_hash, ts, nonce])
 
 
 class ZuoApiClient:
@@ -154,6 +224,11 @@ class ZuoApiClient:
     def __init__(self, base_url: str, timeout: float = 20.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._seed = None
+        self._seed_version = 0
+        self._seed_expires_at = 0.0        # 本地对齐时钟后的 epoch 毫秒
+        self._seed_lock = Lock()
+        self._clock_offset_ms = 0          # 服务端时间 - 本地时间（毫秒），用 zuo-cc-time 校准
 
     # ------------------------------------------------------------------
     # 对外业务方法
@@ -192,35 +267,140 @@ class ZuoApiClient:
     # ------------------------------------------------------------------
     # 底层请求
     # ------------------------------------------------------------------
-    def request(self, path: str, query_params):
-        """携带签名头发起 GET，返回解包成功信封后的 data 下的原始 payload。"""
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": self._user_agent(),
-            **sign_request("GET", path, query_params),
-        }
-        query_string = urlencode({k: v for k, v in query_params if v not in (None, "")})
-        url = f"{self.base_url}{path}"
-        if query_string:
-            url = f"{url}?{query_string}"
-        req = Request(url, headers=headers, method="GET")
-        return self._open(req)
+    def request(self, path: str, query_params=None, method: str = "GET"):
+        """携带动态签名头发起请求，返回解包成功信封后的 payload。
 
-    def _open(self, req):
+        401 且 detail 为 SIGN_EXPIRED / SIGN_IP_MISMATCH 时重拉 seed 并静默重试一次。
+        """
+        query_params = list(query_params or [])
+        for attempt in (0, 1):
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": self._user_agent(),
+                **self._build_auth_header(method, path, query_params),
+            }
+            query_string = urlencode({k: v for k, v in query_params if v not in (None, "")})
+            url = f"{self.base_url}{path}"
+            if query_string:
+                url = f"{url}?{query_string}"
+            req = Request(url, headers=headers, method=method)
+            try:
+                return self._open(req)
+            except ZuoApiError as err:
+                if attempt == 0 and err.sign_detail in _SIGN_SELF_HEAL_DETAILS:
+                    self._invalidate_seed()
+                    continue
+                raise
+
+    def _build_auth_header(self, method, path, query_params):
+        """生成单请求头 zuo-cc-auth: {seed}:{ts}:{nonce}:{sign}。"""
+        seed = self._get_seed()
+        ts = str(self._now_ms())
+        nonce = generate_api_sign_nonce()
+        canonical = build_api_sign_canonical_string(
+            method, path, query_params, API_SIGN_EMPTY_BODY_HASH, ts, nonce, seed
+        )
+        signature = hmac.new(seed.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        return {API_AUTH_HEADER: ":".join([seed, ts, nonce, signature])}
+
+    # ------------------------------------------------------------------
+    # seed 握手与时钟
+    # ------------------------------------------------------------------
+    def _now_ms(self):
+        return int(time.time() * 1000) + self._clock_offset_ms
+
+    def _get_seed(self):
+        with self._seed_lock:
+            if self._seed and self._seed_version is not None and self._now_ms() < self._seed_expires_at:
+                return self._seed
+            self._fetch_seed()
+            return self._seed
+
+    def _invalidate_seed(self):
+        with self._seed_lock:
+            self._seed = None
+            self._seed_version = None
+            self._seed_expires_at = 0.0
+
+    def _fetch_seed(self):
+        """GET /api/security/seed（免签）握得 seed；解析 {seed, expiresIn}，
+        zuo-cc-seed 响应头作 fallback；缓存 seed + 算法版本 + 过期时间。"""
+        url = f"{self.base_url}{SEED_ENDPOINT}"
+        req = Request(url, headers={"Accept": "application/json",
+                                    "User-Agent": self._user_agent()}, method="GET")
+        payload, headers = self._send(req)
+        body = payload
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            body = payload["data"]
+        body = body if isinstance(body, dict) else {}
+        seed = body.get("seed") or headers.get(API_SEED_HEADER)
+        if not seed:
+            raise ZuoApiError("seed 握手失败：响应缺少 seed")
+        expires_ms = body.get("expiresIn")
+        try:
+            expires_ms = int(expires_ms) if expires_ms not in (None, "") else API_SEED_TTL_MS
+        except (TypeError, ValueError):
+            expires_ms = API_SEED_TTL_MS
+        self._seed = seed
+        self._seed_version = extract_algo_version_from_seed(seed)
+        self._seed_expires_at = self._now_ms() + expires_ms
+
+    def _calibrate_clock(self, headers):
+        """读取 zuo-cc-time 响应头校准本地与服务端时钟偏移（毫秒，最小实现）。"""
+        st = headers.get(API_SERVER_TIME_HEADER)
+        if not st:
+            return
+        try:
+            self._clock_offset_ms = int(st) - int(time.time() * 1000)
+        except (TypeError, ValueError):
+            pass
+
+    # ------------------------------------------------------------------
+    # 底层收发与信封
+    # ------------------------------------------------------------------
+    def _send(self, req):
+        """发送请求返回 (payload, headers)；HTTP 错误若带 SIGN_ details 抛带 sign_detail 的错误。"""
         try:
             with urlopen(req, timeout=self.timeout) as resp:
+                headers = resp.headers
+                self._calibrate_clock(headers)
                 data = resp.read()
-                if resp.info().get("Content-Encoding") == "gzip":
+                if headers.get("Content-Encoding") == "gzip":
                     data = gzip.decompress(data)
-                charset = resp.headers.get_content_charset() or "utf-8"
+                charset = headers.get_content_charset() or "utf-8"
                 payload = json.loads(data.decode(charset))
+                return payload, headers
         except HTTPError as err:
+            detail = self._read_sign_detail(err)
+            if detail:
+                raise ZuoApiError("签名校验失败: " + detail, sign_detail=detail)
             raise ZuoApiError(f"HTTP 错误: {err.code}")
         except URLError as err:
             raise ZuoApiError(f"网络错误: {err.reason}")
         except json.JSONDecodeError as err:
             raise ZuoApiError(f"解析响应失败: {err.msg}")
 
+    @staticmethod
+    def _read_sign_detail(err):
+        """从 HTTPError 响应体提取 SIGN_ 开头的 details（供自愈判定）。"""
+        try:
+            body = err.read().decode("utf-8", "replace")
+        except Exception:
+            return None
+        try:
+            obj = json.loads(body)
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        e = obj.get("error")
+        if not isinstance(e, dict):
+            return None
+        details = e.get("details")
+        return details if isinstance(details, str) and details.startswith(_SIGN_DETAIL_PREFIX) else None
+
+    def _open(self, req):
+        payload, _headers = self._send(req)
         # 统一信封解包：成功 { success:true, data }；失败 { success:false, error }
         if isinstance(payload, dict):
             if payload.get("success") is False:
@@ -243,8 +423,8 @@ Calibre-ZUO：从 zuo.cc 抓取网文元数据与封面的 Calibre 刮削插件�
     * 自定义列   : 通过 get_extended_metadata 回填网文字数、连载状态码、首发站、首订数。
 
 数据源
-    复用站点现有只读 API（/api/novel/search、/api/novel），由 src/api.py 负责
-    HMAC 签名（站点签名白名单要求）。请勿改动 src/api.py 中的签名常量。
+    复用站点现有只读 API（/api/novel/search、/api/novel），由上方 ZuoApiClient 负责
+    动态签名（seed 握手 + zuo-cc-auth 单头签名）。请勿改动其中的签名算法常量。
 """
 import time
 from collections import deque
@@ -259,7 +439,7 @@ from calibre.utils.localization import _
 
 PROVIDER_NAME = "Calibre-ZUO Catalog"
 PROVIDER_ID = "calibre_zuo"
-PROVIDER_VERSION = (1, 0, 9)
+PROVIDER_VERSION = (1, 1, 0)
 DEFAULT_BASE_URL = "https://zuo.cc"
 DEFAULT_TIMEOUT = 20
 BUCKET_WINDOW_SECONDS = 600

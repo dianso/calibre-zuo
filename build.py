@@ -2,14 +2,12 @@
 """
 Calibre-ZUO 插件打包脚本。
 把 src/ 目录压缩为 Calibre 可直接「从文件加载插件」的 zip 包。
-产出路径：out/Calibre-ZUO.zip
+产出路径：项目根目录 calibre-zuo.zip
 """
 import os
-import shutil
 import zipfile
 
-OUT_DIR = "out"
-OUT_ZIP = os.path.join(OUT_DIR, "Calibre-ZUO.zip")
+OUT_ZIP = "calibre-zuo.zip"
 SRC_DIR = "src"
 
 
@@ -31,9 +29,7 @@ def zip_src(src_dir: str, zip_path: str) -> None:
 
 
 def main() -> None:
-    if os.path.exists(OUT_DIR):
-        shutil.rmtree(OUT_DIR)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # 不再清理 out 目录；直接覆盖根目录同名 zip
     zip_src(SRC_DIR, OUT_ZIP)
     print(f"插件已输出到: {os.path.abspath(OUT_ZIP)}")
 
