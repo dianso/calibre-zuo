@@ -439,7 +439,7 @@ from calibre.utils.localization import _
 
 PROVIDER_NAME = "Calibre-ZUO Catalog"
 PROVIDER_ID = "calibre_zuo"
-PROVIDER_VERSION = (1, 1, 0)
+PROVIDER_VERSION = (1, 1, 1)
 DEFAULT_BASE_URL = "https://zuo.cc"
 DEFAULT_TIMEOUT = 20
 BUCKET_WINDOW_SECONDS = 600
@@ -754,9 +754,7 @@ class CalibreZuo(Source):
 
         desc = record.get("description")
         if not desc:
-            summary = record.get("summary") or []
-            if summary:
-                desc = "\n".join(summary)
+            desc = self._format_summary(record.get("summary"))
         desc = self._clean_description(desc)
         if desc:
             mi.comments = desc
@@ -821,6 +819,30 @@ class CalibreZuo(Source):
             if isinstance(name, str) and name.strip():
                 names.append(name.strip())
         return names
+
+    @staticmethod
+    def _format_summary(summary):
+        """把新版 JSONB 简介（[{name, content, source?}]）多版本拼成带版本名的分段文本。
+
+        兼容旧格式 string[]；过滤空正文；多版本以空行分隔。
+        """
+        if not summary:
+            return None
+        parts = []
+        for item in summary:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            parts.append(f"{name}\n{content}" if name else content)
+        return "\n\n".join(parts) or None
 
     @staticmethod
     def _clean_description(desc):
